@@ -1,0 +1,422 @@
+name: kodi-16.1-android
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kodi-android-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  KODI_REPO: https://github.com/xbmc/xbmc.git
+  KODI_REF: 16.1-Jarvis
+  CACHE_VER: v3
+  # everything lives under /home/runner: the 16.04 build container mounts only that
+  SRC: /home/runner/kodi
+  DEPS: /home/runner/xbmc-depends
+  TARGET_PREFIX: /home/runner/xbmc-depends/arm-linux-androideabi-android-19
+  NATIVE_PREFIX: /home/runner/xbmc-depends/x86_64-linux-gnu-native
+  TARBALLS: /home/runner/tarballs
+  SDK: /home/runner/android/sdk
+  NDK: /home/runner/android/ndk
+  TC: /home/runner/android/toolchain
+  SDK_PLATFORM: android-19
+
+jobs:
+  android-env:
+    name: A. NDK r10e + SDK 19 + toolchain
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Restore android environment
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: /home/runner/android
+          key: android-r10e-sdk19-${{ env.CACHE_VER }}
+
+      - name: Install NDK, SDK, standalone toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          A=/home/runner/android
+          mkdir -p "$A" "$SDK/build-tools" "$SDK/platforms" "$SDK/tools" /tmp/dl
+
+          # NDK r10e (Linux x86_64, 7z self-extracting)
+          curl -fL --retry 3 -o /tmp/dl/ndk.bin \
+            https://dl.google.com/android/ndk/android-ndk-r10e-linux-x86_64.bin
+          chmod +x /tmp/dl/ndk.bin
+          (cd "$A" && /tmp/dl/ndk.bin >/dev/null)
+          mv "$A/android-ndk-r10e" "$NDK"
+          test -f "$NDK/RELEASE.TXT"
+
+          # SDK: build-tools 19.1.0 + platform 19 (direct zips; both unpack to android-4.4.2/)
+          curl -fL --retry 3 -o /tmp/dl/bt.zip https://dl.google.com/android/repository/build-tools_r19.1-linux.zip
+          curl -fL --retry 3 -o /tmp/dl/p19.zip https://dl.google.com/android/repository/android-19_r04.zip
+          unzip -q /tmp/dl/bt.zip -d /tmp/dl/bt
+          unzip -q /tmp/dl/p19.zip -d /tmp/dl/p19
+          mv /tmp/dl/bt/android-4.4.2 "$SDK/build-tools/19.1.0"
+          mv /tmp/dl/p19/android-4.4.2 "$SDK/platforms/android-19"
+          chmod +x "$SDK/build-tools/19.1.0/aapt" "$SDK/build-tools/19.1.0/dx" "$SDK/build-tools/19.1.0/zipalign"
+          # tools/depends/configure.ac insists on this file existing
+          printf '#!/bin/sh\n' > "$SDK/tools/android"; chmod +x "$SDK/tools/android"
+          test -f "$SDK/platforms/android-19/android.jar"
+
+          # standalone arm toolchain, API 19, gcc 4.8
+          export ANDROID_NDK_ROOT="$NDK"
+          "$NDK/build/tools/make-standalone-toolchain.sh" \
+            --arch=arm --platform="$SDK_PLATFORM" \
+            --toolchain=arm-linux-androideabi-4.8 --install-dir="$TC"
+          "$TC/bin/arm-linux-androideabi-gcc" --version | head -1
+
+          # keep only what depends/packaging still read from the NDK
+          rm -rf "$NDK/sources/cxx-stl" "$NDK/platforms" \
+                 "$NDK"/toolchains/llvm-* "$NDK"/toolchains/x86* "$NDK"/toolchains/mips* \
+                 "$NDK"/toolchains/aarch64* "$NDK/toolchains/arm-linux-androideabi-4.9"
+          test -f "$NDK/sources/android/native_app_glue/android_native_app_glue.h"
+          test -f "$NDK/prebuilt/android-arm/gdbserver/gdbserver"
+          du -sh "$A"
+
+  depends-native:
+    name: B. depends / host tools
+    needs: android-env
+    runs-on: ubuntu-22.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/android
+          key: android-r10e-sdk19-${{ env.CACHE_VER }}
+          fail-on-cache-miss: true
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/tarballs
+          key: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}
+          restore-keys: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/xbmc-depends/x86_64-linux-gnu-native
+          key: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}
+          restore-keys: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-
+
+      - name: Check complete host tools cache
+        id: native-state
+        run: |
+          if [ -f "$NATIVE_PREFIX/.complete-native" ]; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: ./.github/actions/prepare
+        if: steps.native-state.outputs.complete != 'true'
+
+      - name: Build host tools
+        if: steps.native-state.outputs.complete != 'true'
+        run: |
+          /home/runner/dk bash "$GITHUB_WORKSPACE/.github/scripts/build-deps.sh" native
+          touch "$NATIVE_PREFIX/.complete-native"
+
+      # saved even when the build failed, so a retry continues instead of restarting
+      - uses: actions/cache/save@v6
+        if: always() && steps.native-state.outputs.complete != 'true'
+        with:
+          path: /home/runner/xbmc-depends/x86_64-linux-gnu-native
+          key: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/cache/save@v6
+        if: always() && steps.native-state.outputs.complete != 'true'
+        with:
+          path: /home/runner/tarballs
+          key: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}-b${{ github.run_attempt }}
+
+  depends-smb:
+    name: C. SMB stack (samba 4.1.23, isolated)
+    needs: depends-native
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/android
+          key: android-r10e-sdk19-${{ env.CACHE_VER }}
+          fail-on-cache-miss: true
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/tarballs
+          key: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}
+          restore-keys: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/xbmc-depends/x86_64-linux-gnu-native
+          key: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-
+          fail-on-cache-miss: true
+
+      # holds only the SMB-owned files; keyed by the samba patches, so only a changed
+      # SMB patch rebuilds it and the big target prefix cache is never touched
+      - name: Restore SMB cache
+        id: smbcache
+        uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/smb-stage
+          key: smb-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ hashFiles('patches/samba/**') }}
+
+      - uses: ./.github/actions/prepare
+
+      - name: Build libiconv + samba (libsmbclient)
+        if: steps.smbcache.outputs.cache-hit != 'true'
+        run: /home/runner/dk bash "$GITHUB_WORKSPACE/.github/scripts/build-deps.sh" smb
+
+      - name: Check libsmbclient and collect SMB files
+        if: steps.smbcache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          ls -l "$TARGET_PREFIX"/lib/libsmbclient.so* "$TARGET_PREFIX"/include/libsmbclient.h
+          /home/runner/dk "$TC/bin/arm-linux-androideabi-readelf" -d "$TARGET_PREFIX/lib/libsmbclient.so" | grep -i "NEEDED\|SONAME"
+          # everything installed by this stage is newer than the freshly cloned source tree
+          mkdir -p /home/runner/smb-stage
+          (cd "$TARGET_PREFIX" && find . -type f -newer "$SRC/configure.ac" ! -path './.built/*' -print0 \
+             | tar --null -T - -cf - ) | tar -C /home/runner/smb-stage -xf -
+          (cd "$TARGET_PREFIX" && find . -type l -newer "$SRC/configure.ac" -print0 \
+             | tar --null -T - -cf - ) | tar -C /home/runner/smb-stage -xf -
+          test -e /home/runner/smb-stage/lib/libsmbclient.so
+          touch /home/runner/smb-stage/.built-smb
+
+      - name: Save SMB cache
+        if: steps.smbcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: /home/runner/smb-stage
+          key: smb-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ hashFiles('patches/samba/**') }}
+
+  depends-target:
+    name: D. depends / target libs (without samba)
+    needs: depends-native
+    runs-on: ubuntu-22.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/android
+          key: android-r10e-sdk19-${{ env.CACHE_VER }}
+          fail-on-cache-miss: true
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/tarballs
+          key: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}
+          restore-keys: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/xbmc-depends/x86_64-linux-gnu-native
+          key: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-
+          fail-on-cache-miss: true
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/xbmc-depends/arm-linux-androideabi-android-19
+          key: target-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ hashFiles('patches/kodi/**') }}-${{ github.run_id }}
+          restore-keys: target-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ hashFiles('patches/kodi/**') }}-
+
+      - name: Check complete target libraries cache
+        id: target-state
+        run: |
+          if [ -f "$TARGET_PREFIX/.complete-target" ]; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: ./.github/actions/prepare
+        if: steps.target-state.outputs.complete != 'true'
+
+      - name: Build target libraries (make -k, samba excluded)
+        if: steps.target-state.outputs.complete != 'true'
+        run: |
+          /home/runner/dk bash "$GITHUB_WORKSPACE/.github/scripts/build-deps.sh" target
+          touch "$TARGET_PREFIX/.complete-target"
+
+      - uses: actions/cache/save@v6
+        if: always() && steps.target-state.outputs.complete != 'true'
+        with:
+          path: /home/runner/xbmc-depends/arm-linux-androideabi-android-19
+          key: target-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ hashFiles('patches/kodi/**') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/cache/save@v6
+        if: always() && steps.target-state.outputs.complete != 'true'
+        with:
+          path: /home/runner/tarballs
+          key: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}-d${{ github.run_attempt }}
+
+  kodi-apk:
+    name: E. Kodi + APK
+    needs: [depends-target, depends-smb]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/android
+          key: android-r10e-sdk19-${{ env.CACHE_VER }}
+          fail-on-cache-miss: true
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/tarballs
+          key: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}
+          restore-keys: tarballs-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/xbmc-depends/x86_64-linux-gnu-native
+          key: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: native-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-
+          fail-on-cache-miss: true
+
+      - uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/xbmc-depends/arm-linux-androideabi-android-19
+          key: target-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ hashFiles('patches/kodi/**') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: target-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ hashFiles('patches/kodi/**') }}-
+          fail-on-cache-miss: true
+
+      # SMB stack: files from job C, copied over the target prefix
+      - name: Restore SMB cache
+        uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/smb-stage
+          key: smb-${{ env.KODI_REF }}-${{ env.CACHE_VER }}-${{ hashFiles('patches/samba/**') }}
+          fail-on-cache-miss: true
+
+      - name: Overlay SMB stack
+        run: |
+          set -eux
+          cp -a /home/runner/smb-stage/. "$TARGET_PREFIX/"
+          rm -f "$TARGET_PREFIX/.built-smb"
+
+      - uses: ./.github/actions/prepare
+
+      - name: Restore Android system headers
+        # The cached prefix symlinks into D's source tree, which is absent in this job.
+        run: |
+          /home/runner/dk make -C "$SRC/tools/depends/target/android-sources-ics" install-sources
+          test -f "$TARGET_PREFIX/opt/android-source/frameworks/base/include/media/stagefright/MetaData.h"
+
+      - name: Require libsmbclient (SMB stage must have succeeded)
+        run: |
+          if ! ls "$TARGET_PREFIX"/lib/libsmbclient.so >/dev/null 2>&1; then
+            echo "::error::libsmbclient.so is missing - job C (SMB stack) failed, see its log"
+            exit 1
+          fi
+
+      - name: Chinese font and zh_cn language addon
+        run: |
+          set -eux
+          curl -fL --retry 3 -o /tmp/cjk.otf \
+            https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf
+          # Confluence uses Roboto (no CJK glyphs); arial.ttf is the core/subtitle fallback.
+          # Replace all three, FreeType detects the real format from content.
+          for f in "$SRC/media/Fonts/arial.ttf" \
+                   "$SRC/addons/skin.confluence/fonts/Roboto-Regular.ttf" \
+                   "$SRC/addons/skin.confluence/fonts/Roboto-Bold.ttf"; do
+            test -f "$f"
+            cp /tmp/cjk.otf "$f"
+          done
+          curl -fL --retry 3 -o /tmp/zh_cn.zip \
+            https://mirrors.kodi.tv/addons/jarvis/resource.language.zh_cn/resource.language.zh_cn-2.0.3.zip
+          unzip -q -o /tmp/zh_cn.zip -d "$SRC/addons/"
+          test -f "$SRC/addons/resource.language.zh_cn/addon.xml"
+
+      - name: sudo shim and javac 1.7 wrapper
+        run: |
+          set -eux
+          mkdir -p /home/runner/bin
+          # `make apk-unsigned` runs `sudo install`; the container does not need sudo
+          printf '#!/bin/sh\nexec "$@"\n' > /home/runner/bin/sudo
+          # build-tools 19.1.0 dx cannot read Java 8 class files
+          printf '#!/bin/sh\nexec /usr/bin/javac -source 1.7 -target 1.7 "$@"\n' > /home/runner/bin/javac
+          chmod +x /home/runner/bin/sudo /home/runner/bin/javac
+
+      - name: Bootstrap Kodi (official depends entry point)
+        run: /home/runner/dk make -C "$SRC/tools/depends/target/xbmc"
+
+      - name: Configure Kodi
+        # --prefix must be the target prefix: configure loads $prefix/share/config.site
+        run: |
+          /home/runner/dk bash -ec '
+            cd "$SRC"
+            ./configure --prefix="$TARGET_PREFIX" \
+              --enable-codec=libstagefright --disable-libcec --disable-debug \
+              --disable-airplay --disable-airtunes --disable-joystick \
+              --disable-optical-drive --disable-libbluray
+          '
+
+      - name: Build Kodi
+        run: /home/runner/dk bash -ec 'make -C "$SRC" -j"$NPROC"'
+
+      - name: Package unsigned APK
+        run: /home/runner/dk make -C "$SRC" apk-unsigned
+
+      - name: Sign and verify release APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          : "${ANDROID_KEYSTORE_BASE64:?Missing ANDROID_KEYSTORE_BASE64 secret}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Missing ANDROID_KEYSTORE_PASSWORD secret}"
+          signing_dir=$(mktemp -d "$RUNNER_TEMP/android-signing.XXXXXX")
+          output="$SRC/kodiapp-armeabi-v7a-release.apk"
+          verified=false
+          cleanup() {
+            rm -rf "$signing_dir"
+            if [ "$verified" != true ]; then rm -f "$output"; fi
+          }
+          trap cleanup EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$signing_dir/android-release.p12"
+          printf '%s\n' "$ANDROID_KEYSTORE_PASSWORD" > "$signing_dir/password"
+          unset ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD
+          "$JAVA_HOME/bin/jarsigner" \
+            -keystore "$signing_dir/android-release.p12" -storetype PKCS12 \
+            -storepass:file "$signing_dir/password" -keypass:file "$signing_dir/password" \
+            -sigalg SHA256withRSA -digestalg SHA-256 \
+            -signedjar "$signing_dir/signed.apk" \
+            "$SRC/tools/android/packaging/images/kodiapp-debug-armeabi-v7a-unaligned.apk" android
+          /home/runner/dk "$SDK/build-tools/19.1.0/zipalign" -f 4 "$signing_dir/signed.apk" "$output"
+          /home/runner/dk "$SDK/build-tools/19.1.0/zipalign" -c 4 "$output"
+          # Trust only the supplied keystore and require every signed entry to match alias android.
+          "$JAVA_HOME/bin/jarsigner" -verify -strict \
+            -keystore "$signing_dir/android-release.p12" -storetype PKCS12 \
+            -storepass:file "$signing_dir/password" "$output" android
+          verified=true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: kodi-16.1-armeabi-v7a
+          path: /home/runner/kodi/kodiapp-armeabi-v7a-release.apk
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,13 @@
+diff --git a/tools/depends/target/samba-gplv3/Makefile b/tools/depends/target/samba-gplv3/Makefile
+--- a/tools/depends/target/samba-gplv3/Makefile
++++ b/tools/depends/target/samba-gplv3/Makefile
+@@ -32,7 +32,9 @@ CONFIGURE= cp -f $(CONFIG_SUB) $(CONFIG_GUESS) .; \
+ # Then xbmc will correctly access smb shares with LFS enabled
+ # using the altered libsmbclient.h.
+ ifeq ($(OS),android)
++# Android API 19 has no pthread_atfork; use Samba's synchronous pool.
++CONFIGURE+= --disable-pthreadpool
+ export CFLAGS+=-DHAVE_BZERO
+ endif
+ 
+ LIBDYLIB=$(PLATFORM)/source3/bin/libsmbclient.a

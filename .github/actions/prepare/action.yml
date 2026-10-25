@@ -1,0 +1,74 @@
+name: prepare
+description: Build the ubuntu 16.04 build image, fetch Kodi + patches, configure tools/depends
+
+runs:
+  using: composite
+  steps:
+    - name: Free disk space
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL \
+          /usr/local/lib/android /usr/local/share/boost || true
+        df -h / | tail -1
+
+    # Upstream CI ran on Ubuntu 14.04/16.04. Kodi 16's bundled gnulib (m4 1.4.17,
+    # gettext 0.18.2) does not build against glibc >= 2.28, so every build command
+    # runs in a 16.04 userland. JS actions stay on the host; build commands go
+    # through /home/runner/dk, which keeps uid and absolute paths identical.
+    - name: Build image (ubuntu:16.04)
+      shell: bash
+      run: |
+        set -eux
+        for i in 1 2 3; do docker pull ubuntu:16.04 && break || sleep 15; done
+        docker build -t kodi-build - <<'EOF'
+        FROM ubuntu:16.04
+        ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+              build-essential ca-certificates curl git unzip zip bzip2 xz-utils patch file \
+              perl m4 gawk gperf bison flex texinfo gettext autopoint autoconf automake libtool \
+              pkg-config python cmake libcurl4-openssl-dev zlib1g-dev libncurses5-dev \
+              openjdk-8-jdk-headless lib32stdc++6 lib32z1 \
+            && rm -rf /var/lib/apt/lists/*
+        EOF
+        cat > /home/runner/dk <<'EOF'
+        #!/bin/bash
+        exec docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+          -v /home/runner:/home/runner \
+          -e HOME=/home/runner -e LANG=C.UTF-8 \
+          -e SRC -e DEPS -e TARGET_PREFIX -e NATIVE_PREFIX -e TARBALLS \
+          -e SDK -e NDK -e TC -e SDK_PLATFORM \
+          -e NPROC="$(nproc)" \
+          -e PATH="/home/runner/bin:$NATIVE_PREFIX/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+          -w /home/runner \
+          kodi-build "$@"
+        EOF
+        chmod +x /home/runner/dk
+
+    - name: Fetch Kodi source and apply patches
+      shell: bash
+      run: |
+        set -eux
+        git clone --depth 1 --branch "$KODI_REF" "$KODI_REPO" "$SRC"
+        for d in "$GITHUB_WORKSPACE/patches/samba" "$GITHUB_WORKSPACE/patches/kodi"; do
+          for p in "$d"/*.patch; do
+            [ -e "$p" ] || continue
+            git -C "$SRC" apply -v "$p"
+          done
+        done
+
+    - name: Configure tools/depends
+      shell: bash
+      run: |
+        set -eux
+        /home/runner/dk bash -ec '
+          cd "$SRC/tools/depends"
+          ./bootstrap
+          ./configure --with-tarballs="$TARBALLS" --host=arm-linux-androideabi \
+            --with-sdk-path="$SDK" --with-ndk="$NDK" --with-sdk="$SDK_PLATFORM" \
+            --with-toolchain="$TC" --prefix="$DEPS"
+          # the cache paths and manifests assume these prefixes
+          grep -qx "PREFIX=$TARGET_PREFIX" Makefile.include
+          grep -qx "NATIVEPREFIX=$NATIVE_PREFIX" Makefile.include
+        '

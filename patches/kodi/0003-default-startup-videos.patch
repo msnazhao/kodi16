@@ -1,0 +1,12 @@
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -70,7 +70,7 @@
+         </setting>
+         <setting id="lookandfeel.startupwindow" type="integer" label="512" help="36109">
+           <level>0</level>
+-          <default>10000</default> <!-- WINDOW_HOME -->
++          <default>10006</default> <!-- WINDOW_VIDEOS -->
+           <constraints>
+             <options>startupwindows</options>
+           </constraints>

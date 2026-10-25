@@ -1,0 +1,24 @@
+diff --git a/tools/depends/target/samba-gplv3/samba_android.patch b/tools/depends/target/samba-gplv3/samba_android.patch
+--- a/tools/depends/target/samba-gplv3/samba_android.patch
++++ b/tools/depends/target/samba-gplv3/samba_android.patch
+@@ -256,3 +256,20 @@
+  
+  	/* Secondary group members */
+  	for (gr = grp->gr_mem; (*gr != NULL) && ((*gr)[0] != '\0'); gr += 1) {
++
++--- source3/include/libsmbclient.h
+++++ source3/include/libsmbclient.h
++@@ -75,7 +75,13 @@
++ /* Make sure we have the following includes for now ... */
++ #include <sys/types.h>
++ #include <sys/stat.h>
+++#if !defined(ANDROID)
++ #include <sys/statvfs.h>
+++#else
+++#include <sys/vfs.h>
+++#define statvfs statfs
+++#define fstatvfs fstatfs
+++#endif
++ #include <stdint.h>
++ #include <fcntl.h>
++ #include <utime.h>

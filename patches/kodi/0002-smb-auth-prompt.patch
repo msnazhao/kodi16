@@ -1,0 +1,13 @@
+diff --git a/xbmc/filesystem/SMBDirectory.cpp b/xbmc/filesystem/SMBDirectory.cpp
+--- a/xbmc/filesystem/SMBDirectory.cpp
++++ b/xbmc/filesystem/SMBDirectory.cpp
+@@ -253,7 +253,8 @@ int CSMBDirectory::OpenDir(const CURL& url, std::string& strAuth)
+   {
+     std::string cError;
+ 
+-    if (errno == EACCES)
++    // libsmbclient also reports rejected session authentication as EPERM.
++    if (errno == EACCES || errno == EPERM)
+     {
+       if (m_flags & DIR_FLAG_ALLOW_PROMPT)
+         RequireAuthentication(urlIn);
